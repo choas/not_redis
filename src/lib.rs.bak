@@ -340,7 +340,7 @@ impl StorageEngine {
     ///
     /// This removes all keys and their values, and cancels all scheduled expirations.
     pub fn flush(&self) {
-        self.data.clear();
+        self.data.store(Arc::new(DashMap::new()));
         self.expiration.clear();
         self.high_water_mark.store(0, Ordering::Relaxed);
     }
@@ -915,12 +915,12 @@ impl Client {
     {
         let key_str = Self::key_to_string(&key);
         let field_b = Self::value_to_vec(&field);
-        if let Some(stored) = self.storage.data.get(&key_str) {
-            if stored.is_expired() {
+        if let Some(val) = self.storage.get(&key_str) {
+            if val.is_expired() {
                 self.storage.remove(&key_str);
                 return FromRedisValue::from_redis_value(Value::Null);
             }
-            match &*stored.data {
+            match &*val.data {
                 RedisData::Hash(h) => {
                     if let Some(v) = h.get(&field_b) {
                         RV::from_redis_value(Value::String(v.clone()))
@@ -944,12 +944,12 @@ impl Client {
         RV: FromRedisValue,
     {
         let key_str = Self::key_to_string(&key);
-        if let Some(stored) = self.storage.data.get(&key_str) {
-            if stored.is_expired() {
+        if let Some(val) = self.storage.get(&key_str) {
+            if val.is_expired() {
                 self.storage.remove(&key_str);
                 return FromRedisValue::from_redis_value(Value::Array(Vec::new()));
             }
-            match &*stored.data {
+            match &*val.data {
                 RedisData::Hash(h) => {
                     let mut res = Vec::with_capacity(h.len() * 2);
                     for (k, v) in h.iter() {
@@ -1100,12 +1100,12 @@ impl Client {
         RV: FromRedisValue,
     {
         let key_str = Self::key_to_string(&key);
-        if let Some(stored) = self.storage.data.get(&key_str) {
-            if stored.is_expired() {
+        if let Some(val) = self.storage.get(&key_str) {
+            if val.is_expired() {
                 self.storage.remove(&key_str);
                 return FromRedisValue::from_redis_value(Value::Array(Vec::new()));
             }
-            match &*stored.data {
+            match &*val.data {
                 RedisData::Set(s) => {
                     let members: Vec<Value> = s.iter().map(|m| Value::String(m.clone())).collect();
                     FromRedisValue::from_redis_value(Value::Array(members))
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(engine.xlen("stream"), Some(100));
 
         // Get capacity before trim
-        let capacity_before = match &*engine.data.get("stream").unwrap().data {
+        let capacity_before = match &*engine.data.load().get("stream").unwrap().data {
             RedisData::Stream(entries) => entries.capacity(),
             _ => panic!("expected stream"),
         };
@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(engine.xlen("stream"), Some(2));
 
         // Verify capacity shrunk
-        let capacity_after = match &*engine.data.get("stream").unwrap().data {
+        let capacity_after = match &*engine.data.load().get("stream").unwrap().data {
             RedisData::Stream(entries) => entries.capacity(),
             _ => panic!("expected stream"),
         };
@@ -1400,7 +1400,7 @@ mod tests {
         }
 
         // Get capacity before delete
-        let capacity_before = match &*engine.data.get("stream").unwrap().data {
+        let capacity_before = match &*engine.data.load().get("stream").unwrap().data {
             RedisData::Stream(entries) => entries.capacity(),
             _ => panic!("expected stream"),
         };
@@ -1411,7 +1411,7 @@ mod tests {
         assert_eq!(removed, Some(98));
 
         // Verify capacity shrunk
-        let capacity_after = match &*engine.data.get("stream").unwrap().data {
+        let capacity_after = match &*engine.data.load().get("stream").unwrap().data {
             RedisData::Stream(entries) => entries.capacity(),
             _ => panic!("expected stream"),
         };
