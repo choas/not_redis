@@ -1317,7 +1317,13 @@ impl Client {
     }
 
     fn key_to_string<K: ToRedisArgs>(key: &K) -> String {
-        String::from_utf8_lossy(&Self::value_to_vec(key)).to_string()
+        let bytes = Self::value_to_vec(key);
+        // If the bytes are valid UTF-8, String::from_utf8 will take ownership of the Vec without copying.
+        // If not valid (unlikely for keys), fall back to lossy conversion.
+        String::from_utf8(bytes).unwrap_or_else(|err| {
+            let bytes = err.into_bytes();
+            String::from_utf8_lossy(&bytes).to_string()
+        })
     }
 
     fn value_to_vec<V: ToRedisArgs>(v: &V) -> Vec<u8> {
