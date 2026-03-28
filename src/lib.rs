@@ -47,8 +47,8 @@
 //! ```
 
 #![warn(missing_docs)]
+#![allow(clippy::needless_return)]
 
-use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, VecDeque};

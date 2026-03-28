@@ -1,5 +1,5 @@
+#![allow(clippy::let_unit_value)]
 use not_redis::{Client, StorageEngine};
-use rand;
 use std::time::Instant;
 
 #[tokio::main]
