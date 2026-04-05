@@ -4,3 +4,6 @@
 .dolt/
 *.db
 .Dirigent/
+
+# Beads credential key (sensitive)
+.beads/.beads-credential-key
