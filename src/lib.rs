@@ -166,36 +166,59 @@ impl StoredValue {
     }
 }
 
+struct ExpirationState {
+    time_to_keys: BTreeMap<Instant, FxHashSet<String>>,
+    key_to_time: FxHashMap<String, Instant>,
+}
+
 #[derive(Clone)]
 struct ExpirationManager {
-    expirations: Arc<Mutex<BTreeMap<Instant, FxHashSet<String>>>>,
+    state: Arc<Mutex<ExpirationState>>,
     sweep_interval: Duration,
 }
 
 impl ExpirationManager {
     fn new(ms: u64) -> Self {
         Self {
-            expirations: Arc::new(Mutex::new(BTreeMap::new())),
+            state: Arc::new(Mutex::new(ExpirationState {
+                time_to_keys: BTreeMap::new(),
+                key_to_time: FxHashMap::default(),
+            })),
             sweep_interval: Duration::from_millis(ms),
         }
     }
 
     fn schedule(&self, key: String, at: Instant) {
-        let mut e = self.expirations.lock().unwrap();
-        e.entry(at).or_default().insert(key);
+        let mut s = self.state.lock().unwrap();
+        // Remove old expiration for this key if any
+        if let Some(old_at) = s.key_to_time.remove(&key) {
+            if let Some(keys) = s.time_to_keys.get_mut(&old_at) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    s.time_to_keys.remove(&old_at);
+                }
+            }
+        }
+        s.time_to_keys.entry(at).or_default().insert(key.clone());
+        s.key_to_time.insert(key, at);
     }
 
     fn cancel(&self, key: &str) {
-        let mut e = self.expirations.lock().unwrap();
-        e.retain(|_, keys| {
-            keys.remove(key);
-            !keys.is_empty()
-        });
+        let mut s = self.state.lock().unwrap();
+        if let Some(at) = s.key_to_time.remove(key) {
+            if let Some(keys) = s.time_to_keys.get_mut(&at) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    s.time_to_keys.remove(&at);
+                }
+            }
+        }
     }
 
     fn clear(&self) {
-        let mut e = self.expirations.lock().unwrap();
-        e.clear();
+        let mut s = self.state.lock().unwrap();
+        s.time_to_keys.clear();
+        s.key_to_time.clear();
     }
 }
 
@@ -207,6 +230,7 @@ impl ExpirationManager {
 pub struct StorageEngine {
     data: Arc<DashMap<String, StoredValue>>,
     expiration: ExpirationManager,
+    entry_count: Arc<AtomicUsize>,
     high_water_mark: Arc<AtomicUsize>,
 }
 
@@ -220,6 +244,7 @@ impl StorageEngine {
         Self {
             data: Arc::new(DashMap::new()),
             expiration: ExpirationManager::new(100),
+            entry_count: Arc::new(AtomicUsize::new(0)),
             high_water_mark: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -231,17 +256,22 @@ impl StorageEngine {
     pub async fn start_expiration_sweeper(&self) {
         let expiration = self.expiration.clone();
         let data = Arc::clone(&self.data);
+        let entry_count = Arc::clone(&self.entry_count);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(expiration.sweep_interval);
             loop {
                 interval.tick().await;
                 let now = Instant::now();
                 let keys_to_remove: Vec<String> = {
-                    let mut e = expiration.expirations.lock().unwrap();
-                    let expired_times: Vec<Instant> = e.range(..=now).map(|(t, _)| *t).collect();
+                    let mut s = expiration.state.lock().unwrap();
+                    let expired_times: Vec<Instant> =
+                        s.time_to_keys.range(..=now).map(|(t, _)| *t).collect();
                     let mut keys = Vec::new();
                     for t in expired_times {
-                        if let Some(slot_keys) = e.remove(&t) {
+                        if let Some(slot_keys) = s.time_to_keys.remove(&t) {
+                            for key in &slot_keys {
+                                s.key_to_time.remove(key);
+                            }
                             keys.extend(slot_keys);
                         }
                     }
@@ -249,7 +279,9 @@ impl StorageEngine {
                 };
                 // Lock is dropped before removing data
                 for key in keys_to_remove {
-                    data.remove(&key);
+                    if data.remove(&key).is_some() {
+                        entry_count.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -267,33 +299,34 @@ impl StorageEngine {
         // Clone it only if needed to avoid unnecessary allocation.
         let key_for_expire = expire_at.as_ref().map(|_| key.clone());
 
-        match self.data.entry(key) {
+        let is_new = match self.data.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                let old = entry.get().clone();
-                if old.expire_at.is_some() {
+                if entry.get().expire_at.is_some() {
                     self.expiration.cancel(entry.key());
                 }
                 entry.insert(StoredValue {
                     data: Arc::new(value),
                     expire_at,
                 });
+                false
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(StoredValue {
                     data: Arc::new(value),
                     expire_at,
                 });
+                true
             }
-        }
+        };
 
         if let (Some(at), Some(key_expire)) = (expire_at, key_for_expire) {
             self.expiration.schedule(key_expire, at);
         }
 
-        // Update high-water mark if current size exceeds it
-        let current_len = self.data.len();
-        self.high_water_mark
-            .fetch_max(current_len, Ordering::Relaxed);
+        if is_new {
+            let count = self.entry_count.fetch_add(1, Ordering::Relaxed) + 1;
+            self.high_water_mark.fetch_max(count, Ordering::Relaxed);
+        }
     }
 
     /// Gets a value from the storage engine by key.
@@ -311,7 +344,8 @@ impl StorageEngine {
         self.expiration.cancel(key);
         let removed = self.data.remove(key).is_some();
         if removed {
-            self.maybe_compact();
+            let count = self.entry_count.fetch_sub(1, Ordering::Relaxed) - 1;
+            self.maybe_compact(count);
         }
         removed
     }
@@ -323,16 +357,15 @@ impl StorageEngine {
     /// is reset to the current number of entries.
     pub fn compact(&self) {
         self.data.shrink_to_fit();
-        self.high_water_mark
-            .store(self.data.len(), Ordering::Relaxed);
+        let current = self.entry_count.load(Ordering::Relaxed);
+        self.high_water_mark.store(current, Ordering::Relaxed);
     }
 
-    fn maybe_compact(&self) {
+    fn maybe_compact(&self, current_len: usize) {
         let hwm = self.high_water_mark.load(Ordering::Relaxed);
         if hwm == 0 {
             return;
         }
-        let current_len = self.data.len();
         if current_len * 4 < hwm {
             self.compact();
         }
@@ -348,7 +381,7 @@ impl StorageEngine {
 
     /// Returns the number of keys in the storage engine.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if the storage engine contains no keys.
@@ -362,6 +395,7 @@ impl StorageEngine {
     pub fn flush(&self) {
         self.data.clear();
         self.expiration.clear();
+        self.entry_count.store(0, Ordering::Relaxed);
         self.high_water_mark.store(0, Ordering::Relaxed);
     }
 
@@ -506,7 +540,8 @@ impl StorageEngine {
             match Arc::make_mut(&mut stored.data) {
                 RedisData::Stream(entries) => {
                     let original_len = entries.len();
-                    entries.retain(|(id, _)| !entry_ids.contains(&id.as_slice()));
+                    let id_set: FxHashSet<&[u8]> = entry_ids.into_iter().collect();
+                    entries.retain(|(id, _)| !id_set.contains(id.as_slice()));
                     entries.shrink_to_fit();
                     return Some(original_len.saturating_sub(entries.len()));
                 }
@@ -534,20 +569,16 @@ impl StorageEngine {
     ) -> Option<Vec<StreamEntry>> {
         self.data.get(key).map(|stored| match &*stored.data {
             RedisData::Stream(entries) => {
-                let mut result: Vec<_> = entries
-                    .iter()
-                    .filter(|(id, _)| {
-                        let ge_start = start == b"-" || id.as_slice() >= start;
-                        let le_end = end == b"+" || id.as_slice() <= end;
-                        ge_start && le_end
-                    })
-                    .cloned()
-                    .collect();
-
+                let filtered = entries.iter().filter(|(id, _)| {
+                    let ge_start = start == b"-" || id.as_slice() >= start;
+                    let le_end = end == b"+" || id.as_slice() <= end;
+                    ge_start && le_end
+                });
                 if let Some(c) = count {
-                    result.truncate(c);
+                    filtered.take(c).cloned().collect()
+                } else {
+                    filtered.cloned().collect()
                 }
-                result
             }
             _ => vec![],
         })
@@ -569,14 +600,22 @@ impl StorageEngine {
         end: &[u8],
         count: Option<usize>,
     ) -> Option<Vec<StreamEntry>> {
-        // XREVRANGE start=larger, end=smaller; swap for xrange which expects start<=end.
-        // Fetch all matching entries first, then reverse and apply count.
-        self.xrange(key, end, start, None).map(|mut entries| {
-            entries.reverse();
-            if let Some(c) = count {
-                entries.truncate(c);
+        // XREVRANGE start=larger, end=smaller.
+        // Iterate in reverse and apply count early to avoid cloning all entries.
+        self.data.get(key).map(|stored| match &*stored.data {
+            RedisData::Stream(entries) => {
+                let filtered = entries.iter().rev().filter(|(id, _)| {
+                    let le_start = start == b"+" || id.as_slice() <= start;
+                    let ge_end = end == b"-" || id.as_slice() >= end;
+                    le_start && ge_end
+                });
+                if let Some(c) = count {
+                    filtered.take(c).cloned().collect()
+                } else {
+                    filtered.cloned().collect()
+                }
             }
-            entries
+            _ => vec![],
         })
     }
 
@@ -927,17 +966,20 @@ impl Client {
         let key_str = key.into();
         let field_b = Self::value_to_vec(&field);
         let value_b = Self::value_to_vec(&value);
-        // Remove expired key so it's treated as new
-        if let Some(stored) = self.storage.get(&key_str) {
-            if stored.is_expired() {
-                self.storage.remove(&key_str);
-            }
-        }
         let is_new = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::Hash(h) => h.insert(field_b, value_b).is_none(),
-                _ => return Err(RedisError::WrongType),
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut h = FxHashMap::default();
+                h.insert(field_b, value_b);
+                self.storage.set(key_str, RedisData::Hash(h), None);
+                true
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::Hash(h) => h.insert(field_b, value_b).is_none(),
+                    _ => return Err(RedisError::WrongType),
+                }
             }
         } else {
             let mut h = FxHashMap::default();
@@ -1021,14 +1063,12 @@ impl Client {
     {
         let key_str = Self::key_to_string(&key);
         let field_b = Self::value_to_vec(&field);
-        // Expired key has no fields to delete
-        if let Some(stored) = self.storage.get(&key_str) {
+        if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
             if stored.is_expired() {
+                drop(stored);
                 self.storage.remove(&key_str);
                 return Ok(0);
             }
-        }
-        if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
             let data_ref = Arc::make_mut(&mut stored.data);
             match data_ref {
                 RedisData::Hash(h) => {
@@ -1050,20 +1090,23 @@ impl Client {
     {
         let key_str = key.into();
         let val_b = Self::value_to_vec(&value);
-        // Remove expired key so it's treated as a fresh list
-        if let Some(stored) = self.storage.get(&key_str) {
-            if stored.is_expired() {
-                self.storage.remove(&key_str);
-            }
-        }
         let len = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::List(l) => {
-                    l.push_front(val_b);
-                    l.len() as i64
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut l = VecDeque::new();
+                l.push_front(val_b);
+                self.storage.set(key_str, RedisData::List(l), None);
+                1
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::List(l) => {
+                        l.push_front(val_b);
+                        l.len() as i64
+                    }
+                    _ => return Err(RedisError::WrongType),
                 }
-                _ => return Err(RedisError::WrongType),
             }
         } else {
             let mut l = VecDeque::new();
@@ -1083,20 +1126,23 @@ impl Client {
     {
         let key_str = key.into();
         let val_b = Self::value_to_vec(&value);
-        // Remove expired key so it's treated as a fresh list
-        if let Some(stored) = self.storage.get(&key_str) {
-            if stored.is_expired() {
-                self.storage.remove(&key_str);
-            }
-        }
         let len = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::List(l) => {
-                    l.push_back(val_b);
-                    l.len() as i64
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut l = VecDeque::new();
+                l.push_back(val_b);
+                self.storage.set(key_str, RedisData::List(l), None);
+                1
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::List(l) => {
+                        l.push_back(val_b);
+                        l.len() as i64
+                    }
+                    _ => return Err(RedisError::WrongType),
                 }
-                _ => return Err(RedisError::WrongType),
             }
         } else {
             let mut l = VecDeque::new();
@@ -1138,13 +1184,15 @@ impl Client {
     {
         let key_str = key.into();
         let member_b = Self::value_to_vec(&member);
-        // Remove expired key so it's treated as a fresh set
-        if let Some(stored) = self.storage.get(&key_str) {
-            if stored.is_expired() {
-                self.storage.remove(&key_str);
-            }
-        }
         if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut s = FxHashSet::default();
+                s.insert(member_b);
+                self.storage.set(key_str, RedisData::Set(s), None);
+                return Ok(1);
+            }
             let data_ref = Arc::make_mut(&mut stored.data);
             match data_ref {
                 RedisData::Set(s) => {
@@ -1676,14 +1724,18 @@ mod tests {
 
         // Cancel key1 — key2 still present, set not empty
         mgr.cancel("key1");
-        let e = mgr.expirations.lock().unwrap();
-        assert_eq!(e.len(), 1);
-        drop(e);
+        let s = mgr.state.lock().unwrap();
+        assert_eq!(s.time_to_keys.len(), 1);
+        drop(s);
 
         // Cancel key2 — set now empty, should be removed
         mgr.cancel("key2");
-        let e = mgr.expirations.lock().unwrap();
-        assert_eq!(e.len(), 0, "empty time slots should be cleaned up");
+        let s = mgr.state.lock().unwrap();
+        assert_eq!(
+            s.time_to_keys.len(),
+            0,
+            "empty time slots should be cleaned up"
+        );
     }
 
     // --- FromRedisValue tests ---
