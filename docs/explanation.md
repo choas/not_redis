@@ -14,9 +14,10 @@ Redis is powerful, but it comes with operational overhead: you need a running se
     v
   StorageEngine
     |
-    +-- DashMap<String, StoredValue>   (concurrent key-value store)
-    +-- ExpirationManager              (TTL tracking + background sweep)
-    +-- high_water_mark                (compaction trigger)
+    +-- DashMap<String, StoredValue, FxBuildHasher>  (concurrent key-value store)
+    +-- ExpirationManager                            (TTL tracking + background sweep)
+    +-- entry_count: AtomicUsize                     (O(1) key counting)
+    +-- high_water_mark: AtomicUsize                 (compaction trigger)
 ```
 
 ### Client
@@ -33,10 +34,15 @@ Each entry in the map is a `StoredValue` containing:
 
 ### ExpirationManager
 
-Manages key TTLs. Internally it keeps a `BTreeMap<Instant, HashSet<String>>` -- a sorted map from expiration times to sets of keys expiring at that time. A background Tokio task (`start_expiration_sweeper`) wakes up every 100 ms, walks the tree up to `Instant::now()`, and removes expired keys from the `DashMap`.
+Manages key TTLs via a bidirectional index stored in an `ExpirationState` struct:
+- `time_to_keys: BTreeMap<Instant, FxHashSet<String>>` -- maps expiration times to sets of keys
+- `key_to_time: FxHashMap<String, Instant>` -- maps each key back to its expiration time
+
+A background Tokio task (`start_expiration_sweeper`) wakes up every 100 ms, walks the tree up to `Instant::now()`, and removes expired keys from the `DashMap`.
 
 This design means:
-- Setting a TTL is O(log n) in the number of distinct expiration times
+- Setting a TTL is O(log n) in the number of distinct expiration times; rescheduling automatically cleans up the old entry
+- Cancelling a TTL is O(1) via the `key_to_time` reverse lookup (no scan needed)
 - The sweeper only processes entries that have actually expired
 - Expired keys may linger for up to 100 ms after their TTL (lazy cleanup also happens on read)
 
@@ -44,11 +50,11 @@ This design means:
 
 `StoredValue.data` is wrapped in `Arc` so that reads can clone cheaply (incrementing a reference count) without copying the underlying data. Mutations use `Arc::make_mut`, which clones the inner data only if other references exist.
 
-The `high_water_mark` tracks the peak number of keys. When the current count drops below 25% of the peak, `DashMap::shrink_to_fit` is called automatically to reclaim memory from deleted entries.
+An `entry_count` atomic counter tracks the current number of keys. This avoids calling `DashMap::len()` (which must visit every shard) and provides O(1) key counting. The `high_water_mark` tracks the peak `entry_count`. When the current count drops below 25% of the peak, `DashMap::shrink_to_fit` is called automatically to reclaim memory from deleted entries.
 
 ## Data model
 
-not_redis stores data in five structures that map directly to Redis types:
+not_redis stores data in six structures that map directly to Redis types:
 
 | Redis type | Internal representation | Rust type |
 |------------|------------------------|-----------|
@@ -78,7 +84,7 @@ This mirrors the `redis-rs` crate's approach, making migration between real Redi
 
 ## Concurrency model
 
-not_redis achieves thread safety through `DashMap`, which internally shards data across multiple hash maps, each with its own lock. This means:
+not_redis achieves thread safety through `DashMap` (configured with `FxBuildHasher` for faster hashing), which internally shards data across multiple hash maps, each with its own lock. This means:
 
 - **Reads are lock-free** for most access patterns
 - **Writes lock only the affected shard**, not the entire map
