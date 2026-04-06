@@ -1,6 +1,8 @@
 # What Has Changed and Why
 
-A comprehensive overview of all changes made to the **not_redis** fork — what was improved, why each change was made, and the impact on the project.
+A comprehensive overview of all changes made to the **[choas/not_redis](https://github.com/choas/not_redis)** fork (forked from **[cmgriffing/not_redis](https://github.com/cmgriffing/not_redis)**) — what was improved, why each change was made, and the impact on the project.
+
+> **Commit authorship key:** Commits marked with **`[fork]`** were made on the choas/not_redis fork. All other commits originate from the upstream cmgriffing/not_redis repository.
 
 ---
 
@@ -8,7 +10,7 @@ A comprehensive overview of all changes made to the **not_redis** fork — what 
 
 **not_redis** is a Rust in-memory data structure library that provides a Redis-compatible API without networking overhead. Instead of connecting to a Redis server over TCP, applications use not_redis as a direct in-process library, eliminating serialization, deserialization, and round-trip latency entirely.
 
-The fork evolved the project from its initial scaffolding into a mature, well-documented, and highly optimized library through **57 commits** across several phases of development.
+The upstream project (cmgriffing/not_redis) built the core library, benchmarks, CI/CD, and automated performance research. The choas/not_redis fork contributed performance optimizations, comprehensive documentation, code quality analysis, and additional testing infrastructure through **13 commits** on top of the upstream work.
 
 ---
 
@@ -98,19 +100,19 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 
 **Why:** When callers already have a `String`, the old `ToRedisArgs` conversion would serialize it to bytes and then parse it back — a pointless round-trip. `Into<String>` lets owned strings move directly into the storage engine with zero allocation.
 
-### 3h. ExpirationManager Reverse Index (commit `493edea`)
+### 3h. ExpirationManager Reverse Index (commit `493edea`) `[fork]`
 
 **What changed:** Added a `key_to_time: FxHashMap<String, Instant>` reverse index to ExpirationManager, alongside the existing `time_to_keys: BTreeMap<Instant, FxHashSet<String>>`.
 
 **Why:** Cancelling a key's expiration (on overwrite or PERSIST) previously required scanning all entries in the BTreeMap — O(n) in the number of scheduled expirations. The reverse index makes this O(1). This matters when many keys have TTLs.
 
-### 3i. Atomic Entry Counter (commit `493edea`)
+### 3i. Atomic Entry Counter (commit `493edea`) `[fork]`
 
 **What changed:** Replaced `DashMap::len()` with an `AtomicUsize` counter that is incremented on insert and decremented on delete.
 
 **Why:** `DashMap::len()` iterates all shards and briefly locks each one — O(shards) with lock overhead. The atomic counter provides O(1) DBSIZE queries with zero locking. This is especially important under high concurrency.
 
-### 3j. Stream Operation Optimizations (commit `493edea`)
+### 3j. Stream Operation Optimizations (commit `493edea`) `[fork]`
 
 **What changed:**
 - XRANGE/XREVRANGE use `.take(count)` to short-circuit iteration instead of collecting all entries and truncating
@@ -119,7 +121,7 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 
 **Why:** These are algorithmic improvements. The old XRANGE would scan the entire stream even when only 10 entries were requested. The old XDEL performed O(n*m) comparisons (n stream entries times m IDs to delete). These changes reduce both time and memory complexity.
 
-### 3k. Single-Lookup Mutations (commit `493edea`)
+### 3k. Single-Lookup Mutations (commit `493edea`) `[fork]`
 
 **What changed:** HSET, HDEL, LPUSH, RPUSH, SADD now use a single `get_mut()` call to both check for expiration and perform the mutation.
 
@@ -162,7 +164,7 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 
 ## 5. Documentation
 
-### 5a. Diataxis Documentation Framework (commit `1ee50f9`)
+### 5a. Diataxis Documentation Framework (commit `1ee50f9`) `[fork]`
 
 **What changed:** Created four documentation files following the Diataxis framework:
 
@@ -173,13 +175,13 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 
 **Why:** Good documentation serves four distinct needs: learning (tutorials), doing (how-to guides), looking up (reference), and understanding (explanation). The Diataxis framework addresses all four. This makes the library accessible to newcomers while providing depth for advanced users.
 
-### 5b. Architecture Analysis (commit `ddaa000`)
+### 5b. Architecture Analysis (commit `ddaa000`) `[fork]`
 
 **What changed:** Created `analyze_architecture.md` — a 499-line structural analysis of the entire crate, covering module organization, dependency usage, type system design, concurrency patterns, test coverage, and 7 identified structural issues.
 
 **Why:** Understanding the architecture is a prerequisite for making informed improvements. The analysis revealed that the project has ~2,878 lines of orphaned code in `src/storage/`, `src/types/`, `src/client.rs`, and `src/error.rs` that are not compiled into the library (all logic lives in `src/lib.rs`). This informs future refactoring decisions.
 
-### 5c. Security Audit (commit `e99bef4`)
+### 5c. Security Audit (commit `e99bef4`) `[fork]`
 
 **What changed:** Created `analyze_secrets.md` documenting security findings:
 - **Critical:** `.beads/.beads-credential-key` committed to git history
@@ -189,19 +191,19 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 
 **Why:** Security issues compound over time. Documenting them ensures they're tracked and addressed, even if not fixed immediately.
 
-### 5d. Dead Code Analysis (commit `b5905a3`)
+### 5d. Dead Code Analysis (commit `b5905a3`) `[fork]`
 
 **What changed:** Created `analyze_dead_code.md` identifying unused code: 2,878 lines of stale modules, unused enum variants, unused public methods, unreachable branches, and unused dependencies (`arc-swap`, `rand` in library code).
 
 **Why:** Dead code increases maintenance burden and confuses new contributors. Documenting it is the first step toward cleanup.
 
-### 5e. Performance Analysis (commit `7e6e36e`)
+### 5e. Performance Analysis (commit `7e6e36e`) `[fork]`
 
 **What changed:** Created `analyze_performance.md` documenting all 6 optimizations from commit `493edea` with before/after complexity analysis and regression risk assessment.
 
 **Why:** Performance changes need documentation so future contributors understand why the code is structured the way it is and don't accidentally revert optimizations.
 
-### 5f. Contributing Guide (commits `7041c69`, `b0a1fe4`)
+### 5f. Contributing Guide (commits `7041c69` `[fork]`, `b0a1fe4`)
 
 **What changed:** Created `CONTRIBUTING.md` with performance requirements:
 - No benchmark may regress by more than 5%
@@ -269,7 +271,7 @@ The fork evolved the project from its initial scaffolding into a mature, well-do
 **What changed:** Created comprehensive test coverage:
 - **9 unit tests** in `src/lib.rs` covering core functionality
 - **47 integration tests** in `tests/integration_tests.rs` covering all 22 commands, edge cases, expiration behavior, and concurrent access patterns
-- `run_integration_tests.sh` — Convenience script for running integration tests
+- `run_integration_tests.sh` — Convenience script for running integration tests (commit `2ebefa2`) `[fork]`
 
 **Why:** Tests catch regressions and document expected behavior. The integration tests use the public `Client` API, ensuring the library works correctly from a user's perspective.
 
@@ -303,3 +305,30 @@ These numbers reflect the fundamental advantage of in-process access (no network
 | Monolithic lib.rs | Multi-module split | Evolved organically; refactoring is planned |
 | Async API | Sync API | Compatibility with redis-rs traits |
 | 5% benchmark regression gate | No gate | Prevents accidental performance loss |
+
+---
+
+## Appendix: Complete List of Fork Commits
+
+All commits made on the **choas/not_redis** fork (by Lars Gregori), listed in reverse chronological order:
+
+| Commit | Description |
+|--------|-------------|
+| `2012f10` | Document: write comprehensive changelog (this file) |
+| `0daa52e` | Documentation: update docs based on code review |
+| `e219e76` | Documentation: add Redis server startup instructions |
+| `9cf92e4` | chore: update Cargo.lock with itoa dependency |
+| `7e6e36e` | Analysis: identify performance improvement opportunities (`analyze_performance.md`) |
+| `493edea` | **perf: optimize expiration management, entry counting, and stream operations** |
+| `7041c69` | Documentation: update CONTRIBUTING.md with benchmark enforcement details |
+| `b5905a3` | Analysis: find unused functions, dead code, stale modules (`analyze_dead_code.md`) |
+| `e99bef4` | Analysis: security audit for secrets, vulnerabilities (`analyze_secrets.md`) |
+| `ddaa000` | Analysis: architecture review and structural issues (`analyze_architecture.md`) |
+| `1ee50f9` | **feat: fix lint warnings, add Diataxis documentation, improve code quality** |
+| `2ebefa2` | Testing: execute integration tests and create runner script |
+| `ecf97a8` | Analysis: detailed project overview and current state assessment |
+
+The fork's primary contributions fall into three categories:
+1. **Performance optimization** — commit `493edea` implemented 4 algorithmic improvements (reverse expiration index, atomic entry counter, stream short-circuiting, single-lookup mutations)
+2. **Documentation and analysis** — Diataxis docs, architecture analysis, security audit, dead code analysis, performance analysis
+3. **Code quality** — lint fixes, integration test runner, Cargo.lock updates
