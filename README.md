@@ -141,6 +141,9 @@ Batch throughput reaches 4.6--5.2M ops/s for writes and 3.1--3.3M ops/s for read
 Run benchmarks yourself:
 
 ```bash
+# start a Redis server for benchmark comparison
+docker run -d --name redis-bench -p 6379:6379 redis
+
 cargo bench                      # all benchmarks
 cargo bench --bench benchmarks   # core operations
 cargo bench --bench redis_baseline  # comparison with Redis

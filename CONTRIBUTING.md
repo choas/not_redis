@@ -34,6 +34,9 @@ cargo clippy -- -D warnings
 # Run tests
 cargo test --all-features
 
+# Start a Redis server for benchmark comparison
+docker run -d --name redis-bench -p 6379:6379 redis
+
 # Run benchmarks (optional but recommended)
 cargo bench --bench benchmarks
 
