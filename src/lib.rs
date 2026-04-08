@@ -51,7 +51,7 @@
 
 use dashmap::DashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,7 +89,7 @@ pub type RedisResult<T> = Result<T, RedisError>;
 pub enum Value {
     Null,
     Int(i64),
-    String(Vec<u8>),
+    String(SmallVec<[u8; 64]>),
     Array(Vec<Value>),
     Map(Vec<(Value, Value)>),
     Set(Vec<Value>),
@@ -99,17 +99,17 @@ pub enum Value {
 
 impl From<String> for Value {
     fn from(s: String) -> Self {
-        Value::String(s.into_bytes())
+        Value::String(SmallVec::from_vec(s.into_bytes()))
     }
 }
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
-        Value::String(s.as_bytes().to_vec())
+        Value::String(SmallVec::from_slice(s.as_bytes()))
     }
 }
 impl From<Vec<u8>> for Value {
     fn from(b: Vec<u8>) -> Self {
-        Value::String(b)
+        Value::String(SmallVec::from_vec(b))
     }
 }
 impl From<i64> for Value {
@@ -143,11 +143,11 @@ pub type StreamEntry = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
 pub enum RedisData {
-    String(Vec<u8>),
-    List(VecDeque<Vec<u8>>),
-    Set(FxHashSet<Vec<u8>>),
-    Hash(FxHashMap<Vec<u8>, Vec<u8>>),
-    ZSet(BTreeMap<Vec<u8>, f64>),
+    String(SmallVec<[u8; 64]>),
+    List(VecDeque<SmallVec<[u8; 64]>>),
+    Set(FxHashSet<SmallVec<[u8; 64]>>),
+    Hash(FxHashMap<SmallVec<[u8; 64]>, SmallVec<[u8; 64]>>),
+    ZSet(BTreeMap<SmallVec<[u8; 64]>, f64>),
     Stream(Vec<StreamEntry>),
 }
 
@@ -661,19 +661,19 @@ pub trait ToRedisArgs {
 
 impl ToRedisArgs for String {
     fn to_redis_args(&self) -> smallvec::SmallVec<[Value; 1]> {
-        smallvec![Value::String(self.as_bytes().to_vec())]
+        smallvec![Value::String(SmallVec::from_slice(self.as_bytes()))]
     }
 }
 
 impl ToRedisArgs for &str {
     fn to_redis_args(&self) -> smallvec::SmallVec<[Value; 1]> {
-        smallvec![Value::String(self.as_bytes().to_vec())]
+        smallvec![Value::String(SmallVec::from_slice(self.as_bytes()))]
     }
 }
 
 impl ToRedisArgs for Vec<u8> {
     fn to_redis_args(&self) -> smallvec::SmallVec<[Value; 1]> {
-        smallvec![Value::String(self.clone())]
+        smallvec![Value::String(SmallVec::from_slice(self))]
     }
 }
 
@@ -738,7 +738,7 @@ pub trait FromRedisValue: Sized {
 impl FromRedisValue for String {
     fn from_redis_value(v: Value) -> RedisResult<Self> {
         match v {
-            Value::String(s) => String::from_utf8(s).map_err(|_| RedisError::ParseError),
+            Value::String(s) => String::from_utf8(s.into_vec()).map_err(|_| RedisError::ParseError),
             Value::Int(n) => Ok(n.to_string()),
             Value::Null => Ok(String::new()),
             _ => Err(RedisError::ParseError),
@@ -749,7 +749,7 @@ impl FromRedisValue for String {
 impl FromRedisValue for Vec<u8> {
     fn from_redis_value(v: Value) -> RedisResult<Self> {
         match v {
-            Value::String(s) => Ok(s),
+            Value::String(s) => Ok(s.into_vec()),
             _ => Err(RedisError::ParseError),
         }
     }
@@ -759,7 +759,7 @@ impl FromRedisValue for i64 {
     fn from_redis_value(v: Value) -> RedisResult<Self> {
         match v {
             Value::Int(n) => Ok(n),
-            Value::String(s) => String::from_utf8(s)
+            Value::String(s) => std::str::from_utf8(&s)
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or(RedisError::ParseError),
@@ -775,7 +775,7 @@ impl FromRedisValue for bool {
             Value::Bool(b) => Ok(b),
             Value::Int(n) => Ok(n != 0),
             Value::String(s) => {
-                let s_str = String::from_utf8(s).map_err(|_| RedisError::ParseError)?;
+                let s_str = std::str::from_utf8(&s).map_err(|_| RedisError::ParseError)?;
                 Ok(s_str == "1" || s_str.eq_ignore_ascii_case("true"))
             }
             Value::Null => Ok(false),
@@ -1303,7 +1303,12 @@ impl Client {
         let entry_id_bytes = entry_id.map(|s| s.as_bytes().to_vec());
         let values: Vec<(Vec<u8>, Vec<u8>)> = values
             .into_iter()
-            .map(|(f, v)| (Self::value_to_vec(&f), Self::value_to_vec(&v)))
+            .map(|(f, v)| {
+                (
+                    Self::value_to_vec(&f).into_vec(),
+                    Self::value_to_vec(&v).into_vec(),
+                )
+            })
             .collect();
 
         match self
@@ -1415,10 +1420,10 @@ impl Client {
                 let values: Vec<Value> = entries
                     .into_iter()
                     .map(|(id, fields)| {
-                        let mut arr = vec![Value::String(id)];
+                        let mut arr = vec![Value::String(SmallVec::from_vec(id))];
                         for (field, value) in fields {
-                            arr.push(Value::String(field));
-                            arr.push(Value::String(value));
+                            arr.push(Value::String(SmallVec::from_vec(field)));
+                            arr.push(Value::String(SmallVec::from_vec(value)));
                         }
                         Value::Array(arr)
                     })
@@ -1431,25 +1436,23 @@ impl Client {
 
     fn key_to_string<K: ToRedisArgs>(key: &K) -> String {
         let bytes = Self::value_to_vec(key);
-        // If the bytes are valid UTF-8, String::from_utf8 will take ownership of the Vec without copying.
-        // If not valid (unlikely for keys), fall back to lossy conversion.
-        String::from_utf8(bytes).unwrap_or_else(|err| {
+        String::from_utf8(bytes.into_vec()).unwrap_or_else(|err| {
             let bytes = err.into_bytes();
             String::from_utf8_lossy(&bytes).to_string()
         })
     }
 
-    fn value_to_vec<V: ToRedisArgs>(v: &V) -> Vec<u8> {
+    fn value_to_vec<V: ToRedisArgs>(v: &V) -> SmallVec<[u8; 64]> {
         let args = v.to_redis_args();
         for arg in args {
             match arg {
                 Value::String(s) => return s,
-                Value::Int(n) => return n.to_string().into_bytes(),
-                Value::Bool(b) => return vec![if b { b'1' } else { b'0' }],
+                Value::Int(n) => return SmallVec::from_vec(n.to_string().into_bytes()),
+                Value::Bool(b) => return smallvec![if b { b'1' } else { b'0' }],
                 _ => {}
             }
         }
-        Vec::new()
+        SmallVec::new()
     }
 }
 
@@ -1549,8 +1552,16 @@ mod tests {
     #[test]
     fn test_compact_preserves_data() {
         let engine = StorageEngine::new();
-        engine.set("key1", RedisData::String(b"val1".to_vec()), None);
-        engine.set("key2", RedisData::String(b"val2".to_vec()), None);
+        engine.set(
+            "key1",
+            RedisData::String(SmallVec::from_slice(b"val1")),
+            None,
+        );
+        engine.set(
+            "key2",
+            RedisData::String(SmallVec::from_slice(b"val2")),
+            None,
+        );
 
         engine.compact();
 
@@ -1565,7 +1576,7 @@ mod tests {
         for i in 0..100 {
             engine.set(
                 format!("key{}", i),
-                RedisData::String(b"val".to_vec()),
+                RedisData::String(SmallVec::from_slice(b"val")),
                 None,
             );
         }
@@ -1588,7 +1599,7 @@ mod tests {
         for i in 0..100 {
             engine.set(
                 format!("key{}", i),
-                RedisData::String(b"val".to_vec()),
+                RedisData::String(SmallVec::from_slice(b"val")),
                 None,
             );
         }
@@ -1610,7 +1621,7 @@ mod tests {
         for i in 0..100 {
             engine.set(
                 format!("key{}", i),
-                RedisData::String(b"val".to_vec()),
+                RedisData::String(SmallVec::from_slice(b"val")),
                 None,
             );
         }
@@ -1631,7 +1642,7 @@ mod tests {
         for i in 0..50 {
             engine.set(
                 format!("key{}", i),
-                RedisData::String(b"val".to_vec()),
+                RedisData::String(SmallVec::from_slice(b"val")),
                 None,
             );
         }
@@ -1716,7 +1727,7 @@ mod tests {
         let already_past = Instant::now() - Duration::from_secs(1);
         engine.set(
             "expired",
-            RedisData::String(b"val".to_vec()),
+            RedisData::String(SmallVec::from_slice(b"val")),
             Some(already_past),
         );
 
@@ -1752,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_from_redis_value_string() {
-        let v = Value::String(b"hello".to_vec());
+        let v = Value::String(SmallVec::from_slice(b"hello"));
         let s: String = FromRedisValue::from_redis_value(v).unwrap();
         assert_eq!(s, "hello");
     }
@@ -1780,14 +1791,14 @@ mod tests {
 
     #[test]
     fn test_from_redis_value_i64_from_string() {
-        let v = Value::String(b"123".to_vec());
+        let v = Value::String(SmallVec::from_slice(b"123"));
         let n: i64 = FromRedisValue::from_redis_value(v).unwrap();
         assert_eq!(n, 123);
     }
 
     #[test]
     fn test_from_redis_value_i64_invalid_string() {
-        let v = Value::String(b"not_a_number".to_vec());
+        let v = Value::String(SmallVec::from_slice(b"not_a_number"));
         let result: RedisResult<i64> = FromRedisValue::from_redis_value(v);
         assert!(result.is_err());
     }
@@ -1804,8 +1815,8 @@ mod tests {
     #[test]
     fn test_from_redis_value_vec() {
         let v = Value::Array(vec![
-            Value::String(b"a".to_vec()),
-            Value::String(b"b".to_vec()),
+            Value::String(SmallVec::from_slice(b"a")),
+            Value::String(SmallVec::from_slice(b"b")),
         ]);
         let result: Vec<String> = FromRedisValue::from_redis_value(v).unwrap();
         assert_eq!(result, vec!["a", "b"]);
@@ -1824,14 +1835,14 @@ mod tests {
     fn test_to_redis_args_str() {
         let args = "hello".to_redis_args();
         assert_eq!(args.len(), 1);
-        assert_eq!(args[0], Value::String(b"hello".to_vec()));
+        assert_eq!(args[0], Value::String(SmallVec::from_slice(b"hello")));
     }
 
     #[test]
     fn test_to_redis_args_string() {
         let s = String::from("world");
         let args = s.to_redis_args();
-        assert_eq!(args[0], Value::String(b"world".to_vec()));
+        assert_eq!(args[0], Value::String(SmallVec::from_slice(b"world")));
     }
 
     #[test]
@@ -1850,7 +1861,7 @@ mod tests {
     fn test_to_redis_args_option_some() {
         let v: Option<&str> = Some("val");
         let args = v.to_redis_args();
-        assert_eq!(args[0], Value::String(b"val".to_vec()));
+        assert_eq!(args[0], Value::String(SmallVec::from_slice(b"val")));
     }
 
     #[test]
@@ -1865,19 +1876,19 @@ mod tests {
     #[test]
     fn test_value_to_vec_string() {
         let result = Client::value_to_vec(&"hello");
-        assert_eq!(result, b"hello");
+        assert_eq!(result.as_slice(), b"hello");
     }
 
     #[test]
     fn test_value_to_vec_int() {
         let result = Client::value_to_vec(&42i64);
-        assert_eq!(result, b"42");
+        assert_eq!(result.as_slice(), b"42");
     }
 
     #[test]
     fn test_value_to_vec_bool() {
-        assert_eq!(Client::value_to_vec(&true), b"1");
-        assert_eq!(Client::value_to_vec(&false), b"0");
+        assert_eq!(Client::value_to_vec(&true).as_slice(), b"1");
+        assert_eq!(Client::value_to_vec(&false).as_slice(), b"0");
     }
 
     #[test]
@@ -1903,7 +1914,7 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(1);
         client.storage.set(
             "expired_key",
-            RedisData::String(b"val".to_vec()),
+            RedisData::String(SmallVec::from_slice(b"val")),
             Some(past),
         );
 
