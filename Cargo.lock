@@ -535,6 +535,7 @@ dependencies = [
  "arc-swap",
  "criterion",
  "dashmap",
+ "itoa",
  "rand",
  "redis",
  "rustc-hash",

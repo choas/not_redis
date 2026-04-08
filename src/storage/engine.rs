@@ -1,9 +1,9 @@
 //! The core storage engine implementation.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
 
 use super::config::{MaxMemoryPolicy, StorageConfig};
 use super::memory::MemoryTracker;
@@ -16,7 +16,7 @@ use super::expire::ExpirationManager;
 /// and supports key expiration with a background sweeper task.
 #[derive(Clone)]
 pub struct StorageEngine {
-    data: Arc<DashMap<String, StoredValue>>,
+    data: Arc<DashMap<String, StoredValue, FxBuildHasher>>,
     expiration: ExpirationManager,
     memory: MemoryTracker,
 }
@@ -28,7 +28,7 @@ impl StorageEngine {
 
     pub fn new_with_sweep_interval(sweep_interval_ms: u64) -> Self {
         let engine = Self {
-            data: Arc::new(DashMap::new()),
+            data: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             expiration: ExpirationManager::new(sweep_interval_ms),
             memory: MemoryTracker::new(),
         };
@@ -41,7 +41,7 @@ impl StorageEngine {
 
     pub fn with_config(config: StorageConfig) -> Self {
         let mut engine = Self {
-            data: Arc::new(DashMap::new()),
+            data: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             expiration: ExpirationManager::new(100),
             memory: MemoryTracker::new(),
         };
