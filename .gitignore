@@ -3,3 +3,7 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+.Dirigent/
+
+# Beads credential key (sensitive)
+.beads/.beads-credential-key

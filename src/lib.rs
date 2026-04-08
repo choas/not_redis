@@ -50,7 +50,7 @@
 #![allow(clippy::needless_return)]
 
 use dashmap::DashMap;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::smallvec;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,35 +166,59 @@ impl StoredValue {
     }
 }
 
+struct ExpirationState {
+    time_to_keys: BTreeMap<Instant, FxHashSet<String>>,
+    key_to_time: FxHashMap<String, Instant>,
+}
+
 #[derive(Clone)]
 struct ExpirationManager {
-    expirations: Arc<Mutex<BTreeMap<Instant, FxHashSet<String>>>>,
+    state: Arc<Mutex<ExpirationState>>,
     sweep_interval: Duration,
 }
 
 impl ExpirationManager {
     fn new(ms: u64) -> Self {
         Self {
-            expirations: Arc::new(Mutex::new(BTreeMap::new())),
+            state: Arc::new(Mutex::new(ExpirationState {
+                time_to_keys: BTreeMap::new(),
+                key_to_time: FxHashMap::default(),
+            })),
             sweep_interval: Duration::from_millis(ms),
         }
     }
 
     fn schedule(&self, key: String, at: Instant) {
-        let mut e = self.expirations.lock().unwrap();
-        e.entry(at).or_default().insert(key);
+        let mut s = self.state.lock().unwrap();
+        // Remove old expiration for this key if any
+        if let Some(old_at) = s.key_to_time.remove(&key) {
+            if let Some(keys) = s.time_to_keys.get_mut(&old_at) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    s.time_to_keys.remove(&old_at);
+                }
+            }
+        }
+        s.time_to_keys.entry(at).or_default().insert(key.clone());
+        s.key_to_time.insert(key, at);
     }
 
     fn cancel(&self, key: &str) {
-        let mut e = self.expirations.lock().unwrap();
-        for (_, keys) in e.iter_mut() {
-            keys.remove(key);
+        let mut s = self.state.lock().unwrap();
+        if let Some(at) = s.key_to_time.remove(key) {
+            if let Some(keys) = s.time_to_keys.get_mut(&at) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    s.time_to_keys.remove(&at);
+                }
+            }
         }
     }
 
     fn clear(&self) {
-        let mut e = self.expirations.lock().unwrap();
-        e.clear();
+        let mut s = self.state.lock().unwrap();
+        s.time_to_keys.clear();
+        s.key_to_time.clear();
     }
 }
 
@@ -204,8 +228,9 @@ impl ExpirationManager {
 /// and supports key expiration with a background sweeper task.
 #[derive(Clone)]
 pub struct StorageEngine {
-    data: Arc<DashMap<String, StoredValue>>,
+    data: Arc<DashMap<String, StoredValue, FxBuildHasher>>,
     expiration: ExpirationManager,
+    entry_count: Arc<AtomicUsize>,
     high_water_mark: Arc<AtomicUsize>,
 }
 
@@ -217,8 +242,9 @@ impl StorageEngine {
     /// by the background task when started.
     pub fn new() -> Self {
         Self {
-            data: Arc::new(DashMap::new()),
+            data: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             expiration: ExpirationManager::new(100),
+            entry_count: Arc::new(AtomicUsize::new(0)),
             high_water_mark: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -230,22 +256,31 @@ impl StorageEngine {
     pub async fn start_expiration_sweeper(&self) {
         let expiration = self.expiration.clone();
         let data = Arc::clone(&self.data);
+        let entry_count = Arc::clone(&self.entry_count);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(expiration.sweep_interval);
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                let mut e = expiration.expirations.lock().unwrap();
-                let expired: Vec<(Instant, Vec<String>)> = e
-                    .iter()
-                    .filter(|(t, _)| **t <= now)
-                    .map(|(t, keys)| (*t, keys.iter().cloned().collect()))
-                    .collect();
-                for (t, keys) in expired {
-                    e.remove(&t);
-                    for key in keys {
-                        expiration.cancel(&key);
-                        data.remove(&key);
+                let keys_to_remove: Vec<String> = {
+                    let mut s = expiration.state.lock().unwrap();
+                    let expired_times: Vec<Instant> =
+                        s.time_to_keys.range(..=now).map(|(t, _)| *t).collect();
+                    let mut keys = Vec::new();
+                    for t in expired_times {
+                        if let Some(slot_keys) = s.time_to_keys.remove(&t) {
+                            for key in &slot_keys {
+                                s.key_to_time.remove(key);
+                            }
+                            keys.extend(slot_keys);
+                        }
+                    }
+                    keys
+                };
+                // Lock is dropped before removing data
+                for key in keys_to_remove {
+                    if data.remove(&key).is_some() {
+                        entry_count.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -264,32 +299,34 @@ impl StorageEngine {
         // Clone it only if needed to avoid unnecessary allocation.
         let key_for_expire = expire_at.as_ref().map(|_| key.clone());
 
-        match self.data.entry(key) {
+        let is_new = match self.data.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                let old = entry.get().clone();
-                if old.expire_at.is_some() {
+                if entry.get().expire_at.is_some() {
                     self.expiration.cancel(entry.key());
                 }
                 entry.insert(StoredValue {
                     data: Arc::new(value),
                     expire_at,
                 });
+                false
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(StoredValue {
                     data: Arc::new(value),
                     expire_at,
                 });
+                true
             }
-        }
+        };
 
         if let (Some(at), Some(key_expire)) = (expire_at, key_for_expire) {
             self.expiration.schedule(key_expire, at);
         }
 
-        // Update high-water mark if current size exceeds it
-        let current_len = self.data.len();
-        self.high_water_mark.fetch_max(current_len, Ordering::Relaxed);
+        if is_new {
+            let count = self.entry_count.fetch_add(1, Ordering::Relaxed) + 1;
+            self.high_water_mark.fetch_max(count, Ordering::Relaxed);
+        }
     }
 
     /// Gets a value from the storage engine by key.
@@ -307,7 +344,8 @@ impl StorageEngine {
         self.expiration.cancel(key);
         let removed = self.data.remove(key).is_some();
         if removed {
-            self.maybe_compact();
+            let count = self.entry_count.fetch_sub(1, Ordering::Relaxed) - 1;
+            self.maybe_compact(count);
         }
         removed
     }
@@ -319,16 +357,15 @@ impl StorageEngine {
     /// is reset to the current number of entries.
     pub fn compact(&self) {
         self.data.shrink_to_fit();
-        self.high_water_mark
-            .store(self.data.len(), Ordering::Relaxed);
+        let current = self.entry_count.load(Ordering::Relaxed);
+        self.high_water_mark.store(current, Ordering::Relaxed);
     }
 
-    fn maybe_compact(&self) {
+    fn maybe_compact(&self, current_len: usize) {
         let hwm = self.high_water_mark.load(Ordering::Relaxed);
         if hwm == 0 {
             return;
         }
-        let current_len = self.data.len();
         if current_len * 4 < hwm {
             self.compact();
         }
@@ -344,7 +381,7 @@ impl StorageEngine {
 
     /// Returns the number of keys in the storage engine.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if the storage engine contains no keys.
@@ -358,6 +395,7 @@ impl StorageEngine {
     pub fn flush(&self) {
         self.data.clear();
         self.expiration.clear();
+        self.entry_count.store(0, Ordering::Relaxed);
         self.high_water_mark.store(0, Ordering::Relaxed);
     }
 
@@ -502,7 +540,8 @@ impl StorageEngine {
             match Arc::make_mut(&mut stored.data) {
                 RedisData::Stream(entries) => {
                     let original_len = entries.len();
-                    entries.retain(|(id, _)| !entry_ids.contains(&id.as_slice()));
+                    let id_set: FxHashSet<&[u8]> = entry_ids.into_iter().collect();
+                    entries.retain(|(id, _)| !id_set.contains(id.as_slice()));
                     entries.shrink_to_fit();
                     return Some(original_len.saturating_sub(entries.len()));
                 }
@@ -530,20 +569,16 @@ impl StorageEngine {
     ) -> Option<Vec<StreamEntry>> {
         self.data.get(key).map(|stored| match &*stored.data {
             RedisData::Stream(entries) => {
-                let mut result: Vec<_> = entries
-                    .iter()
-                    .filter(|(id, _)| {
-                        let ge_start = start == b"-" || id.as_slice() >= start;
-                        let le_end = end == b"+" || id.as_slice() <= end;
-                        ge_start && le_end
-                    })
-                    .cloned()
-                    .collect();
-
+                let filtered = entries.iter().filter(|(id, _)| {
+                    let ge_start = start == b"-" || id.as_slice() >= start;
+                    let le_end = end == b"+" || id.as_slice() <= end;
+                    ge_start && le_end
+                });
                 if let Some(c) = count {
-                    result.truncate(c);
+                    filtered.take(c).cloned().collect()
+                } else {
+                    filtered.cloned().collect()
                 }
-                result
             }
             _ => vec![],
         })
@@ -553,8 +588,8 @@ impl StorageEngine {
     ///
     /// # Arguments
     /// * `key` - The stream key
-    /// * `start` - Start ID (use "+" for end)
-    /// * `end` - End ID (use "-" for beginning)
+    /// * `start` - Start ID (use "+" for end) — the larger ID
+    /// * `end` - End ID (use "-" for beginning) — the smaller ID
     /// * `count` - Optional maximum number of entries to return
     ///
     /// Returns the entries in reverse order, or None if key is not a stream.
@@ -565,9 +600,22 @@ impl StorageEngine {
         end: &[u8],
         count: Option<usize>,
     ) -> Option<Vec<StreamEntry>> {
-        self.xrange(key, start, end, count).map(|mut entries| {
-            entries.reverse();
-            entries
+        // XREVRANGE start=larger, end=smaller.
+        // Iterate in reverse and apply count early to avoid cloning all entries.
+        self.data.get(key).map(|stored| match &*stored.data {
+            RedisData::Stream(entries) => {
+                let filtered = entries.iter().rev().filter(|(id, _)| {
+                    let le_start = start == b"+" || id.as_slice() <= start;
+                    let ge_end = end == b"-" || id.as_slice() >= end;
+                    le_start && ge_end
+                });
+                if let Some(c) = count {
+                    filtered.take(c).cloned().collect()
+                } else {
+                    filtered.cloned().collect()
+                }
+            }
+            _ => vec![],
         })
     }
 
@@ -575,9 +623,16 @@ impl StorageEngine {
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
-        format!("{}-0", timestamp).into_bytes()
+        // Avoid format! allocation: manually build "{timestamp}-0" as bytes.
+        // Max u64 is 20 digits + "-0" = 22 bytes max.
+        let mut buf = itoa::Buffer::new();
+        let ts_str = buf.format(timestamp);
+        let mut id = Vec::with_capacity(ts_str.len() + 2);
+        id.extend_from_slice(ts_str.as_bytes());
+        id.extend_from_slice(b"-0");
+        id
     }
 }
 
@@ -803,12 +858,13 @@ impl Client {
         RV: FromRedisValue,
     {
         let key_str = key.into();
-        if let Some(val) = self.storage.get(&key_str) {
-            if val.is_expired() {
+        if let Some(stored) = self.storage.data.get(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
                 self.storage.remove(&key_str);
                 return FromRedisValue::from_redis_value(Value::Null);
             }
-            match &*val.data {
+            match &*stored.data {
                 RedisData::String(s) => RV::from_redis_value(Value::String(s.clone())),
                 _ => Err(RedisError::WrongType),
             }
@@ -846,11 +902,22 @@ impl Client {
     /// Checks if one or more keys exist in the database.
     ///
     /// Returns `true` if at least one key exists, `false` otherwise.
+    /// Expired keys are treated as non-existent and cleaned up.
     pub async fn exists<K>(&mut self, key: K) -> RedisResult<bool>
     where
         K: ToRedisArgs,
     {
-        Ok(self.storage.exists(&Self::key_to_string(&key)))
+        let key_str = Self::key_to_string(&key);
+        if let Some(stored) = self.storage.data.get(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                return Ok(false);
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Sets an expiration time on a key.
@@ -864,10 +931,14 @@ impl Client {
     where
         K: ToRedisArgs,
     {
-        Ok(self.storage.set_expiry(
-            &Self::key_to_string(&key),
-            Duration::from_secs(seconds as u64),
-        ))
+        let key_str = Self::key_to_string(&key);
+        if seconds < 0 {
+            // Redis deletes the key when given a negative TTL
+            return Ok(self.storage.remove(&key_str));
+        }
+        Ok(self
+            .storage
+            .set_expiry(&key_str, Duration::from_secs(seconds as u64)))
     }
 
     /// Gets the time-to-live of a key.
@@ -891,7 +962,12 @@ impl Client {
     /// * `V` - The field value
     ///
     /// Returns `1` if the field is new, `0` if the field was updated.
-    pub async fn hset<K: Into<String>, F, V>(&mut self, key: K, field: F, value: V) -> RedisResult<i64>
+    pub async fn hset<K: Into<String>, F, V>(
+        &mut self,
+        key: K,
+        field: F,
+        value: V,
+    ) -> RedisResult<i64>
     where
         F: ToRedisArgs,
         V: ToRedisArgs,
@@ -900,10 +976,19 @@ impl Client {
         let field_b = Self::value_to_vec(&field);
         let value_b = Self::value_to_vec(&value);
         let is_new = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::Hash(h) => h.insert(field_b, value_b).is_none(),
-                _ => return Err(RedisError::WrongType),
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut h = FxHashMap::default();
+                h.insert(field_b, value_b);
+                self.storage.set(key_str, RedisData::Hash(h), None);
+                true
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::Hash(h) => h.insert(field_b, value_b).is_none(),
+                    _ => return Err(RedisError::WrongType),
+                }
             }
         } else {
             let mut h = FxHashMap::default();
@@ -988,6 +1073,11 @@ impl Client {
         let key_str = Self::key_to_string(&key);
         let field_b = Self::value_to_vec(&field);
         if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                return Ok(0);
+            }
             let data_ref = Arc::make_mut(&mut stored.data);
             match data_ref {
                 RedisData::Hash(h) => {
@@ -1010,13 +1100,22 @@ impl Client {
         let key_str = key.into();
         let val_b = Self::value_to_vec(&value);
         let len = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::List(l) => {
-                    l.push_front(val_b);
-                    l.len() as i64
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut l = VecDeque::new();
+                l.push_front(val_b);
+                self.storage.set(key_str, RedisData::List(l), None);
+                1
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::List(l) => {
+                        l.push_front(val_b);
+                        l.len() as i64
+                    }
+                    _ => return Err(RedisError::WrongType),
                 }
-                _ => return Err(RedisError::WrongType),
             }
         } else {
             let mut l = VecDeque::new();
@@ -1037,13 +1136,22 @@ impl Client {
         let key_str = key.into();
         let val_b = Self::value_to_vec(&value);
         let len = if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
-            let data_ref = Arc::make_mut(&mut stored.data);
-            match data_ref {
-                RedisData::List(l) => {
-                    l.push_back(val_b);
-                    l.len() as i64
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut l = VecDeque::new();
+                l.push_back(val_b);
+                self.storage.set(key_str, RedisData::List(l), None);
+                1
+            } else {
+                let data_ref = Arc::make_mut(&mut stored.data);
+                match data_ref {
+                    RedisData::List(l) => {
+                        l.push_back(val_b);
+                        l.len() as i64
+                    }
+                    _ => return Err(RedisError::WrongType),
                 }
-                _ => return Err(RedisError::WrongType),
             }
         } else {
             let mut l = VecDeque::new();
@@ -1062,12 +1170,13 @@ impl Client {
         K: ToRedisArgs,
     {
         let key_str = Self::key_to_string(&key);
-        if let Some(val) = self.storage.get(&key_str) {
-            if val.is_expired() {
+        if let Some(stored) = self.storage.data.get(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
                 self.storage.remove(&key_str);
                 return Ok(0);
             }
-            match &*val.data {
+            match &*stored.data {
                 RedisData::List(l) => Ok(l.len() as i64),
                 _ => Err(RedisError::WrongType),
             }
@@ -1086,6 +1195,14 @@ impl Client {
         let key_str = key.into();
         let member_b = Self::value_to_vec(&member);
         if let Some(mut stored) = self.storage.data.get_mut(&key_str) {
+            if stored.is_expired() {
+                drop(stored);
+                self.storage.remove(&key_str);
+                let mut s = FxHashSet::default();
+                s.insert(member_b);
+                self.storage.set(key_str, RedisData::Set(s), None);
+                return Ok(1);
+            }
             let data_ref = Arc::make_mut(&mut stored.data);
             match data_ref {
                 RedisData::Set(s) => {
@@ -1261,23 +1378,7 @@ impl Client {
             .storage
             .xrange(&key_str, start.as_bytes(), end.as_bytes(), count);
 
-        match entries {
-            Some(entries) => {
-                let values: Vec<Value> = entries
-                    .into_iter()
-                    .map(|(id, fields)| {
-                        let mut arr = vec![Value::String(id)];
-                        for (field, value) in fields {
-                            arr.push(Value::String(field));
-                            arr.push(Value::String(value));
-                        }
-                        Value::Array(arr)
-                    })
-                    .collect();
-                FromRedisValue::from_redis_value(Value::Array(values))
-            }
-            None => FromRedisValue::from_redis_value(Value::Array(Vec::new())),
-        }
+        Self::stream_entries_to_value(entries)
     }
 
     /// Returns entries in a stream within a range, in reverse order.
@@ -1303,6 +1404,12 @@ impl Client {
             .storage
             .xrevrange(&key_str, start.as_bytes(), end.as_bytes(), count);
 
+        Self::stream_entries_to_value(entries)
+    }
+
+    fn stream_entries_to_value<RV: FromRedisValue>(
+        entries: Option<Vec<StreamEntry>>,
+    ) -> RedisResult<RV> {
         match entries {
             Some(entries) => {
                 let values: Vec<Value> = entries
@@ -1338,7 +1445,7 @@ impl Client {
             match arg {
                 Value::String(s) => return s,
                 Value::Int(n) => return n.to_string().into_bytes(),
-                Value::Bool(b) => return (if b { "1" } else { "0" }).to_string().into_bytes(),
+                Value::Bool(b) => return vec![if b { b'1' } else { b'0' }],
                 _ => {}
             }
         }
@@ -1457,7 +1564,7 @@ mod tests {
         let engine = StorageEngine::new();
         for i in 0..100 {
             engine.set(
-                &format!("key{}", i),
+                format!("key{}", i),
                 RedisData::String(b"val".to_vec()),
                 None,
             );
@@ -1480,7 +1587,7 @@ mod tests {
         let engine = StorageEngine::new();
         for i in 0..100 {
             engine.set(
-                &format!("key{}", i),
+                format!("key{}", i),
                 RedisData::String(b"val".to_vec()),
                 None,
             );
@@ -1502,7 +1609,7 @@ mod tests {
         let engine = StorageEngine::new();
         for i in 0..100 {
             engine.set(
-                &format!("key{}", i),
+                format!("key{}", i),
                 RedisData::String(b"val".to_vec()),
                 None,
             );
@@ -1523,7 +1630,7 @@ mod tests {
         let engine = StorageEngine::new();
         for i in 0..50 {
             engine.set(
-                &format!("key{}", i),
+                format!("key{}", i),
                 RedisData::String(b"val".to_vec()),
                 None,
             );
@@ -1533,5 +1640,364 @@ mod tests {
         engine.flush();
         assert_eq!(engine.high_water_mark.load(Ordering::Relaxed), 0);
         assert_eq!(engine.len(), 0);
+    }
+
+    // --- xrevrange correctness tests ---
+
+    #[test]
+    fn test_xrevrange_returns_entries_in_reverse() {
+        let engine = StorageEngine::new();
+        for i in 1..=5 {
+            let id = format!("{}-0", i);
+            engine.xadd(
+                "stream",
+                Some(id.as_bytes()),
+                vec![(b"k".to_vec(), format!("v{}", i).into_bytes())],
+            );
+        }
+
+        let result = engine.xrevrange("stream", b"+", b"-", None).unwrap();
+        let ids: Vec<String> = result
+            .iter()
+            .map(|(id, _)| String::from_utf8(id.clone()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["5-0", "4-0", "3-0", "2-0", "1-0"]);
+    }
+
+    #[test]
+    fn test_xrevrange_with_count() {
+        let engine = StorageEngine::new();
+        for i in 1..=5 {
+            let id = format!("{}-0", i);
+            engine.xadd(
+                "stream",
+                Some(id.as_bytes()),
+                vec![(b"k".to_vec(), b"v".to_vec())],
+            );
+        }
+
+        let result = engine.xrevrange("stream", b"+", b"-", Some(2)).unwrap();
+        assert_eq!(result.len(), 2);
+        // Should be the 2 largest IDs in reverse order
+        let ids: Vec<String> = result
+            .iter()
+            .map(|(id, _)| String::from_utf8(id.clone()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["5-0", "4-0"]);
+    }
+
+    #[test]
+    fn test_xrevrange_with_range() {
+        let engine = StorageEngine::new();
+        for i in 1..=5 {
+            let id = format!("{}-0", i);
+            engine.xadd(
+                "stream",
+                Some(id.as_bytes()),
+                vec![(b"k".to_vec(), b"v".to_vec())],
+            );
+        }
+
+        // XREVRANGE from 4-0 down to 2-0
+        let result = engine.xrevrange("stream", b"4-0", b"2-0", None).unwrap();
+        let ids: Vec<String> = result
+            .iter()
+            .map(|(id, _)| String::from_utf8(id.clone()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["4-0", "3-0", "2-0"]);
+    }
+
+    // --- Expiration-related engine tests ---
+
+    #[test]
+    fn test_expired_key_not_found_by_get() {
+        let engine = StorageEngine::new();
+        // Set a key that is already expired
+        let already_past = Instant::now() - Duration::from_secs(1);
+        engine.set(
+            "expired",
+            RedisData::String(b"val".to_vec()),
+            Some(already_past),
+        );
+
+        let val = engine.get("expired");
+        assert!(val.is_some()); // Engine-level get doesn't filter expired
+        assert!(val.unwrap().is_expired()); // But it IS expired
+    }
+
+    #[test]
+    fn test_cancel_expiration_cleans_empty_sets() {
+        let mgr = ExpirationManager::new(100);
+        let at = Instant::now() + Duration::from_secs(60);
+        mgr.schedule("key1".to_string(), at);
+        mgr.schedule("key2".to_string(), at);
+
+        // Cancel key1 — key2 still present, set not empty
+        mgr.cancel("key1");
+        let s = mgr.state.lock().unwrap();
+        assert_eq!(s.time_to_keys.len(), 1);
+        drop(s);
+
+        // Cancel key2 — set now empty, should be removed
+        mgr.cancel("key2");
+        let s = mgr.state.lock().unwrap();
+        assert_eq!(
+            s.time_to_keys.len(),
+            0,
+            "empty time slots should be cleaned up"
+        );
+    }
+
+    // --- FromRedisValue tests ---
+
+    #[test]
+    fn test_from_redis_value_string() {
+        let v = Value::String(b"hello".to_vec());
+        let s: String = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn test_from_redis_value_string_from_int() {
+        let v = Value::Int(42);
+        let s: String = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(s, "42");
+    }
+
+    #[test]
+    fn test_from_redis_value_string_from_null() {
+        let v = Value::Null;
+        let s: String = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn test_from_redis_value_i64() {
+        let v = Value::Int(99);
+        let n: i64 = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(n, 99);
+    }
+
+    #[test]
+    fn test_from_redis_value_i64_from_string() {
+        let v = Value::String(b"123".to_vec());
+        let n: i64 = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(n, 123);
+    }
+
+    #[test]
+    fn test_from_redis_value_i64_invalid_string() {
+        let v = Value::String(b"not_a_number".to_vec());
+        let result: RedisResult<i64> = FromRedisValue::from_redis_value(v);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_redis_value_bool() {
+        assert!(bool::from_redis_value(Value::Bool(true)).unwrap());
+        assert!(!bool::from_redis_value(Value::Bool(false)).unwrap());
+        assert!(bool::from_redis_value(Value::Int(1)).unwrap());
+        assert!(!bool::from_redis_value(Value::Int(0)).unwrap());
+        assert!(!bool::from_redis_value(Value::Null).unwrap());
+    }
+
+    #[test]
+    fn test_from_redis_value_vec() {
+        let v = Value::Array(vec![
+            Value::String(b"a".to_vec()),
+            Value::String(b"b".to_vec()),
+        ]);
+        let result: Vec<String> = FromRedisValue::from_redis_value(v).unwrap();
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_from_redis_value_vec_from_null() {
+        let v = Value::Null;
+        let result: Vec<String> = FromRedisValue::from_redis_value(v).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // --- ToRedisArgs tests ---
+
+    #[test]
+    fn test_to_redis_args_str() {
+        let args = "hello".to_redis_args();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0], Value::String(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_to_redis_args_string() {
+        let s = String::from("world");
+        let args = s.to_redis_args();
+        assert_eq!(args[0], Value::String(b"world".to_vec()));
+    }
+
+    #[test]
+    fn test_to_redis_args_i64() {
+        let args = 42i64.to_redis_args();
+        assert_eq!(args[0], Value::Int(42));
+    }
+
+    #[test]
+    fn test_to_redis_args_bool() {
+        let args = true.to_redis_args();
+        assert_eq!(args[0], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_to_redis_args_option_some() {
+        let v: Option<&str> = Some("val");
+        let args = v.to_redis_args();
+        assert_eq!(args[0], Value::String(b"val".to_vec()));
+    }
+
+    #[test]
+    fn test_to_redis_args_option_none() {
+        let v: Option<String> = None;
+        let args = v.to_redis_args();
+        assert_eq!(args[0], Value::Null);
+    }
+
+    // --- value_to_vec / key_to_string helper tests ---
+
+    #[test]
+    fn test_value_to_vec_string() {
+        let result = Client::value_to_vec(&"hello");
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_value_to_vec_int() {
+        let result = Client::value_to_vec(&42i64);
+        assert_eq!(result, b"42");
+    }
+
+    #[test]
+    fn test_value_to_vec_bool() {
+        assert_eq!(Client::value_to_vec(&true), b"1");
+        assert_eq!(Client::value_to_vec(&false), b"0");
+    }
+
+    #[test]
+    fn test_key_to_string_basic() {
+        let result = Client::key_to_string(&"mykey");
+        assert_eq!(result, "mykey");
+    }
+
+    #[test]
+    fn test_key_to_string_unicode() {
+        let result = Client::key_to_string(&"你好");
+        assert_eq!(result, "你好");
+    }
+
+    // --- Expiration Client-level tests ---
+
+    #[tokio::test]
+    async fn test_exists_returns_false_for_expired_key() {
+        let mut client = Client::new();
+        client.start().await;
+
+        // Set a key with an already-past expiration
+        let past = Instant::now() - Duration::from_secs(1);
+        client.storage.set(
+            "expired_key",
+            RedisData::String(b"val".to_vec()),
+            Some(past),
+        );
+
+        let exists: bool = client.exists("expired_key").await.unwrap();
+        assert!(!exists, "expired key should not be reported as existing");
+    }
+
+    #[tokio::test]
+    async fn test_lpush_on_expired_key_creates_new_list() {
+        let mut client = Client::new();
+        client.start().await;
+
+        // Create a list, then expire it
+        client.lpush("mylist", "old_item").await.unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        client.storage.data.get_mut("mylist").unwrap().expire_at = Some(past);
+
+        // lpush on expired key should create a fresh list
+        let len: i64 = client.lpush("mylist", "new_item").await.unwrap();
+        assert_eq!(len, 1, "expired list should be replaced with new one");
+    }
+
+    #[tokio::test]
+    async fn test_sadd_on_expired_key_creates_new_set() {
+        let mut client = Client::new();
+        client.start().await;
+
+        client.sadd("myset", "old").await.unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        client.storage.data.get_mut("myset").unwrap().expire_at = Some(past);
+
+        let added: i64 = client.sadd("myset", "new").await.unwrap();
+        assert_eq!(added, 1);
+
+        let members: Vec<String> = client.smembers("myset").await.unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], "new");
+    }
+
+    #[tokio::test]
+    async fn test_hset_on_expired_key_creates_new_hash() {
+        let mut client = Client::new();
+        client.start().await;
+
+        client.hset("myhash", "old_field", "old_val").await.unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        client.storage.data.get_mut("myhash").unwrap().expire_at = Some(past);
+
+        let is_new: i64 = client.hset("myhash", "new_field", "new_val").await.unwrap();
+        assert_eq!(is_new, 1);
+
+        // Old field should be gone
+        let old: String = client.hget("myhash", "old_field").await.unwrap();
+        assert_eq!(old, "");
+    }
+
+    #[tokio::test]
+    async fn test_expire_negative_deletes_key() {
+        let mut client = Client::new();
+        client.start().await;
+
+        client.set("mykey", "value").await.unwrap();
+        let result: bool = client.expire("mykey", -1).await.unwrap();
+        assert!(
+            result,
+            "expire with negative TTL should return true for existing key"
+        );
+
+        let exists: bool = client.exists("mykey").await.unwrap();
+        assert!(!exists, "key should be deleted after negative expire");
+    }
+
+    #[tokio::test]
+    async fn test_expire_negative_nonexistent() {
+        let mut client = Client::new();
+        client.start().await;
+
+        let result: bool = client.expire("nokey", -1).await.unwrap();
+        assert!(
+            !result,
+            "expire with negative TTL on non-existent key should return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hdel_on_expired_key_returns_zero() {
+        let mut client = Client::new();
+        client.start().await;
+
+        client.hset("myhash", "field1", "val1").await.unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        client.storage.data.get_mut("myhash").unwrap().expire_at = Some(past);
+
+        let deleted: i64 = client.hdel("myhash", "field1").await.unwrap();
+        assert_eq!(deleted, 0, "hdel on expired key should return 0");
     }
 }
