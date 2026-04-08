@@ -158,20 +158,12 @@ This is a downstream consequence of change #3. If `Value::String` uses `SmallVec
 
 | # | Optimization | Our Status | Effort | Impact |
 |---|---|---|---|---|
-| 1 | FxBuildHasher for DashMap | Done (lib.rs only) | - | - |
+| 1 | FxBuildHasher for DashMap | Done (lib.rs + storage/engine.rs) | - | - |
 | 2 | Direct DashMap access in Client::get | Done | - | - |
-| 3 | SmallVec<[u8;64]> for Value::String | **Not done** | Medium | **High** |
-| 4 | SmallVec<[u8;64]> for RedisData | **Not done** | High | **High** |
-| 5 | Remove Arc::clone in set() | Partially done | Low | Low |
-| 6 | str::from_utf8 instead of String::from_utf8 | **Not done** | Low | Low |
-| 7 | value_to_vec returning SmallVec | **Not done** | Medium | Medium |
+| 3 | SmallVec<[u8;64]> for Value::String | **Done** | Medium | **High** |
+| 4 | SmallVec<[u8;64]> for RedisData | **Done** (lib.rs + storage/types.rs) | High | **High** |
+| 5 | Remove Arc::clone in set() | Done (lib.rs uses entry API) | Low | Low |
+| 6 | str::from_utf8 instead of String::from_utf8 | **Done** | Low | Low |
+| 7 | value_to_vec returning SmallVec | **Done** | Medium | Medium |
 
-### Recommended adoption order
-
-1. **Change #6** (str::from_utf8) -- trivial, zero-risk, immediate small gain
-2. **Change #5** (Arc::clone in storage/engine.rs) -- small fix in the modular engine
-3. **Changes #3 + #4 + #7** (SmallVec migration) -- these should be done together as they are interdependent. This is the bulk of the performance improvement but also the largest change, touching `Value`, `RedisData`, `ToRedisArgs`, `FromRedisValue`, `value_to_vec`, and all tests
-
-### Additional note on our codebase
-
-We have two parallel implementations: the monolithic `src/lib.rs` and the modular `src/storage/` directory. The FxBuildHasher optimization only exists in `lib.rs`. If `src/storage/engine.rs` is the canonical implementation going forward, it also needs the FxBuildHasher change applied.
+All optimizations from PR #5 have been implemented. The `StreamEntry` type intentionally remains `Vec<u8>` (matching the PR), with `SmallVec::from_vec()` / `.into_vec()` conversions at the stream boundary.

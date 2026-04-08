@@ -1,6 +1,7 @@
 //! Internal data types for the storage engine.
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
@@ -10,11 +11,11 @@ use std::time::Instant;
 /// as opposed to the RESP protocol [`Value`](crate::Value) types.
 #[derive(Debug, Clone)]
 pub enum RedisData {
-    String(Vec<u8>),
-    List(VecDeque<Vec<u8>>),
-    Set(FxHashSet<Vec<u8>>),
-    Hash(FxHashMap<Vec<u8>, Vec<u8>>),
-    ZSet(BTreeMap<Vec<u8>, f64>),
+    String(SmallVec<[u8; 64]>),
+    List(VecDeque<SmallVec<[u8; 64]>>),
+    Set(FxHashSet<SmallVec<[u8; 64]>>),
+    Hash(FxHashMap<SmallVec<[u8; 64]>, SmallVec<[u8; 64]>>),
+    ZSet(BTreeMap<SmallVec<[u8; 64]>, f64>),
 }
 
 /// A value stored in the storage engine with optional expiration.
@@ -43,19 +44,19 @@ impl RedisData {
             RedisData::String(data) => data.len(),
             RedisData::List(deque) => {
                 deque.iter().map(|v| v.len()).sum::<usize>()
-                    + std::mem::size_of::<Vec<u8>>() * deque.capacity()
+                    + std::mem::size_of::<SmallVec<[u8; 64]>>() * deque.capacity()
             }
             RedisData::Set(set) => {
                 set.iter().map(|v| v.len()).sum::<usize>()
-                    + std::mem::size_of::<Vec<u8>>() * set.capacity()
+                    + std::mem::size_of::<SmallVec<[u8; 64]>>() * set.capacity()
             }
             RedisData::Hash(map) => {
                 map.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
-                    + std::mem::size_of::<(Vec<u8>, Vec<u8>)>() * map.capacity()
+                    + std::mem::size_of::<(SmallVec<[u8; 64]>, SmallVec<[u8; 64]>)>() * map.capacity()
             }
             RedisData::ZSet(map) => {
                 map.iter().map(|(k, _)| k.len()).sum::<usize>()
-                    + std::mem::size_of::<(Vec<u8>, f64)>() * map.capacity()
+                    + std::mem::size_of::<(SmallVec<[u8; 64]>, f64)>() * map.capacity()
                     + std::mem::size_of::<f64>()
             }
         }
